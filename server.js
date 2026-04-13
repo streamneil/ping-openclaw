@@ -68,6 +68,7 @@ wss.on('connection', (frontendSocket, req) => {
   // ── 步骤 B：Openclaw → 前端 的消息透传管道 ───────────────────────────────────
   openclawSocket.on('message', (data) => {
     const raw = data.toString();
+    console.log(`[${new Date().toISOString()}] [OPENCLAW→PROXY]`, raw);
 
     // 拦截 OPENCLAW 协议握手流程
     try {
@@ -133,6 +134,7 @@ wss.on('connection', (frontendSocket, req) => {
 
   // ── 步骤 C：前端 → Openclaw 的消息透传管道 ───────────────────────────────────
   frontendSocket.on('message', (data) => {
+    console.log(`[${new Date().toISOString()}] [FRONT→PROXY]`, data.toString());
     // 仅在 Openclaw 连接已就绪时才转发
     if (openclawSocket.readyState === WebSocket.OPEN) {
       openclawSocket.send(data.toString());
