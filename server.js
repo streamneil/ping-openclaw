@@ -52,12 +52,9 @@ wss.on('connection', (frontendSocket, req) => {
   const clientId = `${req.socket.remoteAddress}:${req.socket.remotePort}`;
   console.log(`[Proxy] 前端已连接 [${clientId}]`);
 
-  // ── 步骤 A：立即向底层 Openclaw 发起带鉴权 Header 的 WebSocket 连接 ──────────
-  const openclawSocket = new WebSocket(CONFIG.OPENCLAW_WS_URL, {
-    headers: {
-      Authorization: `Bearer ${CONFIG.OPENCLAW_TOKEN}`,
-    },
-  });
+  // ── 步骤 A：立即向底层 Openclaw 发起连接，Token 通过 URL query string 传递 ────
+  const openclawUrl = `${CONFIG.OPENCLAW_WS_URL}?token=${encodeURIComponent(CONFIG.OPENCLAW_TOKEN)}`;
+  const openclawSocket = new WebSocket(openclawUrl);
 
   // ── 步骤 B：Openclaw → 前端 的消息透传管道 ───────────────────────────────────
   openclawSocket.on('message', (data) => {
