@@ -63,19 +63,24 @@ wss.on('connection', (frontendSocket, req) => {
   openclawSocket.on('message', (data) => {
     const raw = data.toString();
 
+    // 打印 Openclaw 返回的所有原始消息（调试用）
+    console.log(`[Proxy] [${clientId}] Openclaw RAW →`, raw);
+
     // 拦截 connect.challenge：由代理自动完成鉴权握手，不透传给前端
     try {
       const msg = JSON.parse(raw);
       if (msg.type === 'event' && msg.event === 'connect.challenge') {
         const nonce = msg.payload?.nonce;
-        console.log(`[Proxy] [${clientId}] 收到 challenge，自动回复 auth (nonce=${nonce})`);
-        openclawSocket.send(JSON.stringify({
+        const authMsg = JSON.stringify({
           type: 'auth',
           payload: {
             token: CONFIG.OPENCLAW_TOKEN,
             nonce,
           },
-        }));
+        });
+        console.log(`[Proxy] [${clientId}] 收到 challenge，自动回复 auth (nonce=${nonce})`);
+        console.log(`[Proxy] [${clientId}] 发送 auth →`, authMsg);
+        openclawSocket.send(authMsg);
         return; // 不向前端转发此握手消息
       }
     } catch (_) { /* 非 JSON，走正常透传 */ }
