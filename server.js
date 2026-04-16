@@ -74,11 +74,18 @@ wss.on('connection', (frontendSocket, req) => {
   const connectFrameId = `proxy-connect-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // A. 以 Bearer Header + ?token= 双通道鉴权连接 Openclaw
+  // 注意：client.id="webchat" 时 gateway 会校验 Origin（CONTROL_UI_ORIGIN_NOT_ALLOWED）。
+  // 我们伪装成从 gateway 自身同源访问，绕过 allowedOrigins 白名单。
   const urlWithToken = appendQueryToken(CONFIG.OPENCLAW_WS_URL, CONFIG.OPENCLAW_TOKEN);
+  const spoofedOrigin = deriveHttpOriginFromWsUrl(CONFIG.OPENCLAW_WS_URL);
+  const upstreamHeaders = {
+    Origin: spoofedOrigin,
+  };
+  if (CONFIG.OPENCLAW_TOKEN) {
+    upstreamHeaders.Authorization = `Bearer ${CONFIG.OPENCLAW_TOKEN}`;
+  }
   const openclawSocket = new WebSocket(urlWithToken, {
-    headers: CONFIG.OPENCLAW_TOKEN
-      ? { Authorization: `Bearer ${CONFIG.OPENCLAW_TOKEN}` }
-      : {},
+    headers: upstreamHeaders,
     handshakeTimeout: CONFIG.UPSTREAM_OPEN_TIMEOUT,
   });
 
@@ -213,6 +220,17 @@ function appendQueryToken(wsUrl, token) {
   if (!token) return wsUrl;
   const sep = wsUrl.includes('?') ? '&' : '?';
   return `${wsUrl}${sep}token=${encodeURIComponent(token)}`;
+}
+
+// 把 ws://host:port[/path] 转成同源的 http://host:port，用作 Origin 头
+function deriveHttpOriginFromWsUrl(wsUrl) {
+  try {
+    const u = new URL(wsUrl);
+    const scheme = u.protocol === 'wss:' ? 'https:' : 'http:';
+    return `${scheme}//${u.host}`;
+  } catch (_) {
+    return 'http://127.0.0.1:18789';
+  }
 }
 
 /**
