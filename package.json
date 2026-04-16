@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "ping": "node ping.js"
+    "ping": "node ping.js",
+    "probe": "node probe-auth.js"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
