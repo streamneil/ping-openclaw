@@ -39,7 +39,21 @@ cp .env.example .env
 ```env
 OPENCLAW_TOKEN=your_real_token_here
 OPENCLAW_WS_URL=ws://your-server-ip:18789
+PORT=8192            # 可选
+DEBUG_WS=false       # 可选，true 时打印双向 WS 报文
 ```
+
+### 独立连通性测试
+
+当无法确定对端 Openclaw 是否就绪时，先跑：
+
+```bash
+npm run ping
+# 或指定地址
+node ping.js ws://192.168.31.237:18789
+```
+
+输出里应看到 `✓ WS 已打开（握手成功）`，以及 Openclaw 下发的首批消息（通常含 `connect.challenge`）。
 
 > 也可以直接修改 `server.js` 中的 `CONFIG` 对象，详见下方[配置说明](#配置说明)。
 

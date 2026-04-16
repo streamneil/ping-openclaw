@@ -1,13 +1,15 @@
 /**
  * Openclaw WebSocket 中转代理服务 (Proxy Server)
  *
- * 架构：前端 <——WS——> 本服务 <——WS+Auth——> Openclaw 底层引擎
+ * 架构：浏览器 <——WS——> 本服务 <——WS(+Auth)——> Openclaw 底层引擎
  *
  * 职责：
  *   1. 托管前端静态文件 (Express)
  *   2. 向前端暴露 WebSocket 接入点
- *   3. 为每个前端连接，以受信任身份连接到底层 Openclaw 引擎（注入 Bearer Token）
- *   4. 双向透传消息，对前端屏蔽底层细节
+ *   3. 为每个前端连接以受信任身份连接 Openclaw（Bearer Header + ?token= 双重注入）
+ *   4. 自动响应 Openclaw 的 connect.challenge 握手
+ *   5. 双向透传消息；Openclaw 未就绪时先缓冲前端消息而不是丢弃
+ *   6. 心跳保活 & 状态广播（proxy_status）
  */
 
 const express = require('express');
@@ -15,149 +17,196 @@ const http = require('http');
 const WebSocket = require('ws');
 const path = require('path');
 
-// 加载 .env 文件中的环境变量（文件不存在时静默跳过）
 require('dotenv').config();
 
-// ─── 配置区 ────────────────────────────────────────────────────────────────────
+// ─── 配置 ─────────────────────────────────────────────────────────────────────
 const CONFIG = {
-  // 本服务监听端口
-  PORT: 8192,
-
-  // 底层 Openclaw 引擎地址（优先读取 .env 中的 OPENCLAW_WS_URL）
+  PORT: Number(process.env.PORT) || 8192,
+  // 监听地址：默认仅本机回环；在 openclaw 同机部署时这是最安全的默认值。
+  // 如果需要从局域网其他设备访问前端，设 HOST=0.0.0.0。
+  HOST: process.env.HOST || '127.0.0.1',
   OPENCLAW_WS_URL: process.env.OPENCLAW_WS_URL || 'ws://127.0.0.1:18789',
-
-  // 注入到 Openclaw 连接的鉴权 Token（优先读取 .env 中的 OPENCLAW_TOKEN）
-  OPENCLAW_TOKEN: process.env.OPENCLAW_TOKEN || 'YOUR_SECRET_TOKEN_HERE',
-
-  // 静态文件目录
+  OPENCLAW_TOKEN: process.env.OPENCLAW_TOKEN || '',
   PUBLIC_DIR: path.join(__dirname, 'public'),
+  DEBUG_WS: String(process.env.DEBUG_WS || '').toLowerCase() === 'true',
+  // Openclaw 连接握手/等待超时（毫秒）
+  UPSTREAM_OPEN_TIMEOUT: 8000,
+  // 心跳间隔（毫秒），0 表示关闭
+  HEARTBEAT_INTERVAL: 25000,
 };
-// ──────────────────────────────────────────────────────────────────────────────
 
-// 1. 创建 Express 应用，托管静态文件
+if (!CONFIG.OPENCLAW_TOKEN) {
+  console.warn('[Proxy] ⚠ 环境变量 OPENCLAW_TOKEN 为空，鉴权大概率会失败');
+}
+
+// ─── HTTP + WS Server ────────────────────────────────────────────────────────
 const app = express();
 app.use(express.static(CONFIG.PUBLIC_DIR));
 
-// 2. 创建 HTTP Server（WebSocket Server 将附加在此之上）
-const server = http.createServer(app);
+// 健康检查端点，便于运维 / 自测脚本使用
+app.get('/healthz', (_req, res) => {
+  res.json({
+    ok: true,
+    upstream: CONFIG.OPENCLAW_WS_URL,
+    port: CONFIG.PORT,
+    clients: wss ? wss.clients.size : 0,
+  });
+});
 
-// 3. 在同一个 HTTP Server 上启动 WebSocket Server
+const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-console.log(`[Proxy] 服务启动中...`);
-console.log(`[Proxy] 底层引擎地址: ${CONFIG.OPENCLAW_WS_URL}`);
+console.log('[Proxy] 服务启动中...');
+console.log(`[Proxy] 监听地址:   ${CONFIG.HOST}:${CONFIG.PORT}`);
+console.log(`[Proxy] 底层引擎:   ${CONFIG.OPENCLAW_WS_URL}`);
+console.log(`[Proxy] Token:      ${CONFIG.OPENCLAW_TOKEN ? '******(已注入)' : '(未配置)'}`);
+console.log(`[Proxy] 调试报文:   ${CONFIG.DEBUG_WS ? 'ON' : 'OFF'}`);
 
-// ─── 核心：处理每个前端客户端的连接 ───────────────────────────────────────────
+// ─── 核心：每个前端连接 ──────────────────────────────────────────────────────
 wss.on('connection', (frontendSocket, req) => {
   const clientId = `${req.socket.remoteAddress}:${req.socket.remotePort}`;
-  console.log(`[Proxy] 前端已连接 [${clientId}]`);
+  console.log(`[Proxy] [${clientId}] 前端已连接`);
 
-  // ── 步骤 A：立即向底层 Openclaw 发起带鉴权 Header 的 WebSocket 连接 ──────────
-  const openclawSocket = new WebSocket(CONFIG.OPENCLAW_WS_URL, {
-    headers: {
-      Authorization: `Bearer ${CONFIG.OPENCLAW_TOKEN}`,
-    },
+  // Openclaw 未就绪前缓冲前端消息（避免首条消息丢失）
+  const pendingFromFrontend = [];
+  let upstreamReady = false;
+
+  // A. 以 Bearer Header + ?token= 双通道鉴权连接 Openclaw
+  const urlWithToken = appendQueryToken(CONFIG.OPENCLAW_WS_URL, CONFIG.OPENCLAW_TOKEN);
+  const openclawSocket = new WebSocket(urlWithToken, {
+    headers: CONFIG.OPENCLAW_TOKEN
+      ? { Authorization: `Bearer ${CONFIG.OPENCLAW_TOKEN}` }
+      : {},
+    handshakeTimeout: CONFIG.UPSTREAM_OPEN_TIMEOUT,
   });
 
-  // ── 步骤 B：Openclaw → 前端 的消息透传管道 ───────────────────────────────────
+  // 对前端通告代理状态（不影响业务数据流，前端可选监听）
+  notifyProxy(frontendSocket, 'connecting', `connecting to ${CONFIG.OPENCLAW_WS_URL}`);
+
+  // B. Openclaw → 前端
   openclawSocket.on('message', (data) => {
     const raw = data.toString();
+    if (CONFIG.DEBUG_WS) console.log(`[${ts()}] [${clientId}] ⇠ OPENCLAW  ${raw}`);
 
-    // 拦截 connect.challenge：由代理自动完成鉴权握手，不透传给前端
+    // 拦截 connect.challenge 握手：代理自行完成，不透传
     try {
       const msg = JSON.parse(raw);
-      if (msg.type === 'event' && msg.event === 'connect.challenge') {
+      if (msg?.type === 'event' && msg?.event === 'connect.challenge') {
         const nonce = msg.payload?.nonce;
-        console.log(`[Proxy] [${clientId}] 收到 challenge，自动回复 auth (nonce=${nonce})`);
-        openclawSocket.send(JSON.stringify({
+        console.log(`[Proxy] [${clientId}] challenge → auth (nonce=${nonce})`);
+        safeSend(openclawSocket, JSON.stringify({
           type: 'auth',
-          payload: {
-            token: CONFIG.OPENCLAW_TOKEN,
-            nonce,
-          },
+          payload: { token: CONFIG.OPENCLAW_TOKEN, nonce },
         }));
-        return; // 不向前端转发此握手消息
+        return;
       }
     } catch (_) { /* 非 JSON，走正常透传 */ }
 
-    // 其余消息正常转发给前端
-    if (frontendSocket.readyState === WebSocket.OPEN) {
-      frontendSocket.send(raw);
-    }
+    safeSend(frontendSocket, raw);
   });
 
-  // ── 步骤 C：前端 → Openclaw 的消息透传管道 ───────────────────────────────────
+  // C. 前端 → Openclaw（带 OPEN 前的缓冲）
   frontendSocket.on('message', (data) => {
-    // 仅在 Openclaw 连接已就绪时才转发
+    const raw = data.toString();
+    if (CONFIG.DEBUG_WS) console.log(`[${ts()}] [${clientId}] ⇢ FRONTEND ${raw}`);
+
     if (openclawSocket.readyState === WebSocket.OPEN) {
-      openclawSocket.send(data.toString());
+      openclawSocket.send(raw);
+    } else if (openclawSocket.readyState === WebSocket.CONNECTING) {
+      // 尚未就绪，先缓冲；open 事件里一次性发出
+      pendingFromFrontend.push(raw);
     } else {
-      // Openclaw 尚未就绪，向前端反馈错误
-      console.warn(`[Proxy] [${clientId}] Openclaw 未就绪，消息丢弃`);
-      safeSend(frontendSocket, JSON.stringify({
-        type: 'proxy_error',
-        message: '底层引擎连接尚未建立，请稍后重试',
-      }));
+      notifyProxy(frontendSocket, 'error', '底层引擎连接已关闭，消息未发送');
     }
   });
 
-  // ── 步骤 D：异常与断开处理 ────────────────────────────────────────────────────
-
-  // Openclaw 连接成功
+  // D. 就绪与断开
   openclawSocket.on('open', () => {
-    console.log(`[Proxy] [${clientId}] 已连接至 Openclaw`);
+    upstreamReady = true;
+    console.log(`[Proxy] [${clientId}] ✓ 已连接至 Openclaw`);
+    notifyProxy(frontendSocket, 'ready', 'upstream connected');
+
+    // 把缓冲的消息一次性发出
+    while (pendingFromFrontend.length) {
+      safeSend(openclawSocket, pendingFromFrontend.shift());
+    }
   });
 
-  // Openclaw 连接发生错误（网络抖动、服务未启动等）
   openclawSocket.on('error', (err) => {
-    console.error(`[Proxy] [${clientId}] Openclaw 连接错误:`, err.message);
-    safeSend(frontendSocket, JSON.stringify({
-      type: 'proxy_error',
-      message: `底层引擎连接失败: ${err.message}`,
-    }));
+    console.error(`[Proxy] [${clientId}] Openclaw 连接错误: ${err.message}`);
+    notifyProxy(frontendSocket, 'error', `底层引擎连接失败: ${err.message}`);
   });
 
-  // Openclaw 连接断开 → 同步关闭前端连接
   openclawSocket.on('close', (code, reason) => {
-    console.log(`[Proxy] [${clientId}] Openclaw 断开 (code=${code})`);
+    const reasonText = reason ? reason.toString() : '';
+    console.log(`[Proxy] [${clientId}] Openclaw 断开 code=${code} reason=${reasonText}`);
+    notifyProxy(frontendSocket, 'closed', `upstream closed (code=${code})`);
     if (frontendSocket.readyState === WebSocket.OPEN) {
       frontendSocket.close(1001, 'Upstream connection closed');
     }
   });
 
-  // 前端连接断开 → 同步关闭 Openclaw 连接（释放资源）
   frontendSocket.on('close', (code) => {
-    console.log(`[Proxy] [${clientId}] 前端断开 (code=${code})`);
-    if (openclawSocket.readyState !== WebSocket.CLOSED) {
+    console.log(`[Proxy] [${clientId}] 前端断开 code=${code}`);
+    if (openclawSocket.readyState !== WebSocket.CLOSED &&
+        openclawSocket.readyState !== WebSocket.CLOSING) {
       openclawSocket.close();
     }
   });
 
-  // 前端连接发生错误
   frontendSocket.on('error', (err) => {
-    console.error(`[Proxy] [${clientId}] 前端连接错误:`, err.message);
-    if (openclawSocket.readyState !== WebSocket.CLOSED) {
-      openclawSocket.close();
-    }
+    console.error(`[Proxy] [${clientId}] 前端连接错误: ${err.message}`);
+    if (openclawSocket.readyState !== WebSocket.CLOSED) openclawSocket.close();
   });
+
+  // E. 心跳保活（双向 ping）
+  if (CONFIG.HEARTBEAT_INTERVAL > 0) {
+    const hb = setInterval(() => {
+      if (frontendSocket.readyState === WebSocket.OPEN) frontendSocket.ping();
+      if (openclawSocket.readyState === WebSocket.OPEN) openclawSocket.ping();
+    }, CONFIG.HEARTBEAT_INTERVAL);
+    const stop = () => clearInterval(hb);
+    frontendSocket.once('close', stop);
+    openclawSocket.once('close', stop);
+  }
+
+  // F. 连接就绪超时 — 如果在限定时间内 open 没触发，显式告知前端
+  setTimeout(() => {
+    if (!upstreamReady && openclawSocket.readyState === WebSocket.CONNECTING) {
+      console.warn(`[Proxy] [${clientId}] 上游连接超时（${CONFIG.UPSTREAM_OPEN_TIMEOUT}ms）`);
+      notifyProxy(frontendSocket, 'error', `连接 Openclaw 超时（${CONFIG.UPSTREAM_OPEN_TIMEOUT}ms）`);
+      try { openclawSocket.terminate(); } catch (_) {}
+    }
+  }, CONFIG.UPSTREAM_OPEN_TIMEOUT + 200);
 });
 
-// ─── 工具函数：安全发送（防止向已关闭的 socket 写入造成 crash）─────────────────
+// ─── 工具函数 ────────────────────────────────────────────────────────────────
 function safeSend(socket, data) {
-  if (socket.readyState === WebSocket.OPEN) {
-    socket.send(data);
-  }
+  if (socket && socket.readyState === WebSocket.OPEN) socket.send(data);
 }
 
-// ─── 启动 HTTP + WS Server ────────────────────────────────────────────────────
-server.listen(CONFIG.PORT, () => {
-  console.log(`[Proxy] ✓ HTTP + WebSocket 服务已启动 → http://localhost:${CONFIG.PORT}`);
+function notifyProxy(socket, state, message) {
+  safeSend(socket, JSON.stringify({ type: 'proxy_status', state, message }));
+}
+
+function appendQueryToken(wsUrl, token) {
+  if (!token) return wsUrl;
+  const sep = wsUrl.includes('?') ? '&' : '?';
+  return `${wsUrl}${sep}token=${encodeURIComponent(token)}`;
+}
+
+function ts() {
+  return new Date().toISOString();
+}
+
+// ─── 启动 ───────────────────────────────────────────────────────────────────
+server.listen(CONFIG.PORT, CONFIG.HOST, () => {
+  const displayHost = CONFIG.HOST === '0.0.0.0' ? 'localhost' : CONFIG.HOST;
+  console.log(`[Proxy] ✓ HTTP + WebSocket 服务已启动 → http://${displayHost}:${CONFIG.PORT}`);
+  if (CONFIG.HOST === '0.0.0.0') {
+    console.log('[Proxy] ⚠ HOST=0.0.0.0 — 局域网内任意设备都能访问，请确保网络可信');
+  }
 });
 
-// 捕获全局未处理异常，防止进程意外退出
-process.on('uncaughtException', (err) => {
-  console.error('[Proxy] 未捕获的异常:', err);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('[Proxy] 未处理的 Promise 拒绝:', reason);
-});
+process.on('uncaughtException', (err) => console.error('[Proxy] 未捕获的异常:', err));
+process.on('unhandledRejection', (r) => console.error('[Proxy] 未处理的 Promise 拒绝:', r));

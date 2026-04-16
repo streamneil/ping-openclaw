@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "ping": "node ping.js"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

@@ -737,14 +737,63 @@
     ws = new WebSocket(WS_URL);
 
     ws.addEventListener('open', () => {
-      updateStatus('connected');
-      sendBtn.disabled = false;
-      appendSystemMsg('LINK ESTABLISHED · OPENCLAW PROXY READY');
+      // 代理已连上，但 Openclaw 还没握手完成；等 proxy_status=ready 再标 ONLINE
+      updateStatus('connecting');
+      sendBtn.disabled = true;
+      appendSystemMsg('PROXY LINK · WAITING FOR UPSTREAM');
     });
 
     ws.addEventListener('message', (event) => {
+      // proxy_status 系统消息由代理层注入，不走对话气泡
+      try {
+        const obj = JSON.parse(event.data);
+        if (obj && obj.type === 'proxy_status') {
+          handleProxyStatus(obj);
+          return;
+        }
+        if (obj && obj.type === 'proxy_error') {
+          // 兼容老版本错误格式
+          handleProxyStatus({ state: 'error', message: obj.message });
+          return;
+        }
+      } catch (_) { /* 非 JSON，走透传 */ }
       renderAgentMessage(event.data);
     });
+
+    function handleProxyStatus({ state, message }) {
+      if (state === 'ready') {
+        updateStatus('connected');
+        sendBtn.disabled = false;
+        appendSystemMsg('UPSTREAM READY · OPENCLAW ONLINE');
+      } else if (state === 'connecting') {
+        updateStatus('connecting');
+        sendBtn.disabled = true;
+      } else if (state === 'closed') {
+        updateStatus('disconnected');
+        sendBtn.disabled = true;
+        appendSystemMsg(message ? `LINK DOWN · ${message.toUpperCase()}` : 'LINK DOWN');
+      } else if (state === 'error') {
+        updateStatus('disconnected');
+        sendBtn.disabled = true;
+        renderProxyError(message || 'unknown error');
+      }
+    }
+
+    function renderProxyError(text) {
+      hideEmpty();
+      const row = document.createElement('div');
+      row.className = 'msg-row agent error';
+      row.innerHTML = `
+        <div class="avatar">OC</div>
+        <div class="msg-body">
+          <div class="msg-meta">
+            <span class="msg-sender">ERROR</span>
+            <span class="msg-time">${getTime()}</span>
+          </div>
+          <div class="bubble">⚠ ${escapeHtml(text)}</div>
+        </div>`;
+      appendAndScroll(row);
+    }
 
     ws.addEventListener('close', (e) => {
       updateStatus('disconnected');
@@ -805,27 +854,15 @@
     row.className = 'msg-row agent';
 
     let content = '';
-    let isError = false;
-
     try {
       const parsed = JSON.parse(raw);
-
-      if (parsed.type === 'proxy_error') {
-        // 代理层注入的错误
-        isError = true;
-        row.classList.add('error');
-        content = `<div class="bubble">⚠ ${escapeHtml(parsed.message)}</div>`;
-      } else {
-        // 格式化 JSON 并语法高亮
-        const formatted = JSON.stringify(parsed, null, 2);
-        content = `<div class="bubble"><pre>${highlightJson(formatted)}</pre></div>`;
-      }
+      const formatted = JSON.stringify(parsed, null, 2);
+      content = `<div class="bubble"><pre>${highlightJson(formatted)}</pre></div>`;
     } catch {
-      // 非 JSON：纯文本
       content = `<div class="bubble">${escapeHtml(raw)}</div>`;
     }
 
-    const senderLabel = isError ? 'ERROR' : 'AGENT';
+    const senderLabel = 'AGENT';
     row.innerHTML = `
       <div class="avatar">OC</div>
       <div class="msg-body">
