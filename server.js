@@ -228,10 +228,15 @@ function appendQueryToken(wsUrl, token) {
  * 目前先发一个"尽力而为"的最小合法帧，启动就能看到服务端返回的 validation error，
  * 错误里会指明缺了哪些字段（errorShape 携带 formatValidationErrors 输出）。
  */
-function buildConnectFrame(frameId, token) {
-  // 顶层加 type:"req" — 与服务端响应 type:"res" 对称。
-  // server.impl-CsRRyd9F.js 的 validateRequestFrame 先检查 request 帧"形状"，
-  // 缺少此字段就会在真正校验 method/params 之前直接 1008 "invalid request frame"。
+function buildConnectFrame(frameId /* token 由 URL/Header 传递，schema 不允许出现在 params 里 */) {
+  // 协议约束（来自服务端 validateConnectParams 的错误反馈）：
+  //   - params 里不能有 'token' / 'authorization' 字段（token 在 URL query / Bearer header 中）
+  //   - params.client.id 是预定义白名单（anyOf + const），不能自造
+  //   - 必须有 minProtocol=3, maxProtocol=3（当前协议版本）
+  // client.id 的候选值（从官方实现里挑最合适的一个）：
+  //   - "webchat": webchat 客户端
+  //   - 其他（control, cli 等待确认）
+  // 这里先用 "webchat" 因为我们是一个 web 聊天前端的中转代理。
   return JSON.stringify({
     type: 'req',
     id: frameId,
@@ -240,7 +245,7 @@ function buildConnectFrame(frameId, token) {
       minProtocol: 3,
       maxProtocol: 3,
       client: {
-        id: 'ping-openclaw-proxy',
+        id: 'webchat',
         displayName: 'Ping Openclaw Proxy',
         mode: 'webchat',
         version: '1.0.0',
@@ -248,8 +253,6 @@ function buildConnectFrame(frameId, token) {
         deviceFamily: 'desktop',
         instanceId: `proxy-${process.pid}`,
       },
-      token,
-      authorization: token ? `Bearer ${token}` : undefined,
     },
   });
 }
