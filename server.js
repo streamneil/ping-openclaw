@@ -229,7 +229,11 @@ function appendQueryToken(wsUrl, token) {
  * 错误里会指明缺了哪些字段（errorShape 携带 formatValidationErrors 输出）。
  */
 function buildConnectFrame(frameId, token) {
+  // 顶层加 type:"req" — 与服务端响应 type:"res" 对称。
+  // server.impl-CsRRyd9F.js 的 validateRequestFrame 先检查 request 帧"形状"，
+  // 缺少此字段就会在真正校验 method/params 之前直接 1008 "invalid request frame"。
   return JSON.stringify({
+    type: 'req',
     id: frameId,
     method: 'connect',
     params: {
