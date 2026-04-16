@@ -70,6 +70,8 @@ wss.on('connection', (frontendSocket, req) => {
   // Openclaw 未就绪前缓冲前端消息（避免首条消息丢失）
   const pendingFromFrontend = [];
   let upstreamReady = false;
+  // 代理注入的 connect 握手 id：收到对应 res 时不透传给前端
+  const connectFrameId = `proxy-connect-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // A. 以 Bearer Header + ?token= 双通道鉴权连接 Openclaw
   const urlWithToken = appendQueryToken(CONFIG.OPENCLAW_WS_URL, CONFIG.OPENCLAW_TOKEN);
@@ -84,24 +86,45 @@ wss.on('connection', (frontendSocket, req) => {
   notifyProxy(frontendSocket, 'connecting', `connecting to ${CONFIG.OPENCLAW_WS_URL}`);
 
   // B. Openclaw → 前端
+  // 协议说明（读源码得出，server.impl-CsRRyd9F.js:23694）：
+  //   - OpenClaw Gateway 采用 JSON-RPC 式握手。第一帧必须是：
+  //       { id, method: "connect", params: { minProtocol, maxProtocol, client: {...}, ... } }
+  //   - 服务端可能主动推送 { type:"event", event:"connect.challenge", payload:{nonce,ts} }
+  //     这是**通知**，**不是**让你回应。回任何非 connect 的 request 帧 → 立即 1008。
+  //   - 成功握手后服务端回 { type:"res", id:<frame.id>, ok:true, ... }，
+  //     后续才能发业务 method 帧。
   openclawSocket.on('message', (data) => {
     const raw = data.toString();
     if (CONFIG.DEBUG_WS) console.log(`[${ts()}] [${clientId}] ⇠ OPENCLAW  ${raw}`);
 
-    // 拦截 connect.challenge 握手：代理自行完成，不透传
     try {
       const msg = JSON.parse(raw);
+
+      // connect.challenge 只是通知（包含 nonce/ts），我们不回复它
       if (msg?.type === 'event' && msg?.event === 'connect.challenge') {
-        const nonce = msg.payload?.nonce;
-        console.log(`[Proxy] [${clientId}] challenge → auth (nonce=${nonce})`);
-        safeSend(openclawSocket, JSON.stringify({
-          type: 'auth',
-          payload: { token: CONFIG.OPENCLAW_TOKEN, nonce },
-        }));
+        if (CONFIG.DEBUG_WS) console.log(`[Proxy] [${clientId}] ignore connect.challenge notice`);
         return;
       }
-    } catch (_) { /* 非 JSON，走正常透传 */ }
 
+      // 拦截对我们 connect 帧的响应 — 不要把代理私下的握手响应透传给前端
+      if (msg?.type === 'res' && msg?.id === connectFrameId) {
+        if (msg.ok) {
+          upstreamReady = true;
+          console.log(`[Proxy] [${clientId}] ✓ connect handshake OK`);
+          notifyProxy(frontendSocket, 'ready', 'upstream connected');
+          while (pendingFromFrontend.length) {
+            safeSend(openclawSocket, pendingFromFrontend.shift());
+          }
+        } else {
+          const err = msg.error || {};
+          console.error(`[Proxy] [${clientId}] ✗ connect rejected: ${err.message || JSON.stringify(err)}`);
+          notifyProxy(frontendSocket, 'error', `connect rejected: ${err.message || 'unknown'}`);
+        }
+        return;
+      }
+    } catch (_) { /* 非 JSON，走透传 */ }
+
+    // 其余帧照常透传给前端
     safeSend(frontendSocket, raw);
   });
 
@@ -120,16 +143,13 @@ wss.on('connection', (frontendSocket, req) => {
     }
   });
 
-  // D. 就绪与断开
+  // D. WS 握手成功后，立即主动发送 connect 请求帧（协议要求第一帧必须是 connect）
   openclawSocket.on('open', () => {
-    upstreamReady = true;
-    console.log(`[Proxy] [${clientId}] ✓ 已连接至 Openclaw`);
-    notifyProxy(frontendSocket, 'ready', 'upstream connected');
-
-    // 把缓冲的消息一次性发出
-    while (pendingFromFrontend.length) {
-      safeSend(openclawSocket, pendingFromFrontend.shift());
-    }
+    console.log(`[Proxy] [${clientId}] WS 已连上，发送 connect 握手帧`);
+    const connectFrame = buildConnectFrame(connectFrameId, CONFIG.OPENCLAW_TOKEN);
+    if (CONFIG.DEBUG_WS) console.log(`[${ts()}] [${clientId}] ⇢ OPENCLAW  ${connectFrame}`);
+    safeSend(openclawSocket, connectFrame);
+    // upstreamReady 在收到 connect res 时再置 true（见上面 B 分支）
   });
 
   openclawSocket.on('error', (err) => {
@@ -193,6 +213,41 @@ function appendQueryToken(wsUrl, token) {
   if (!token) return wsUrl;
   const sep = wsUrl.includes('?') ? '&' : '?';
   return `${wsUrl}${sep}token=${encodeURIComponent(token)}`;
+}
+
+/**
+ * 构造 OpenClaw Gateway 的 connect 请求帧（协议版本 3）。
+ *
+ * 字段来源：从 `server.impl-CsRRyd9F.js` 握手处理代码反推
+ *   - 顶层：{ id, method: "connect", params: {...} }
+ *   - params.minProtocol / maxProtocol：当前支持 3（见源码对 minProtocol/maxProtocol 的校验）
+ *   - params.client：{ id, displayName, mode, version, platform, deviceFamily, ... }
+ *   - params 里可能还需要 token / authorization 字段（精确字段名由 validateConnectParams schema 决定，
+ *     待后续把前端 bundle 里的 connect 帧构造 copy 过来再补全）
+ *
+ * 目前先发一个"尽力而为"的最小合法帧，启动就能看到服务端返回的 validation error，
+ * 错误里会指明缺了哪些字段（errorShape 携带 formatValidationErrors 输出）。
+ */
+function buildConnectFrame(frameId, token) {
+  return JSON.stringify({
+    id: frameId,
+    method: 'connect',
+    params: {
+      minProtocol: 3,
+      maxProtocol: 3,
+      client: {
+        id: 'ping-openclaw-proxy',
+        displayName: 'Ping Openclaw Proxy',
+        mode: 'webchat',
+        version: '1.0.0',
+        platform: process.platform,
+        deviceFamily: 'desktop',
+        instanceId: `proxy-${process.pid}`,
+      },
+      token,
+      authorization: token ? `Bearer ${token}` : undefined,
+    },
+  });
 }
 
 function ts() {
