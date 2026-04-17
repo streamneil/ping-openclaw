@@ -1,148 +1,68 @@
-# Ping Openclaw — WebSocket 中转代理服务
+# Ping Openclaw
 
-为 Openclaw AI Agent 引擎提供一个安全的 WebSocket 代理层，并内置极简的前端测试控制台。
-
-## 架构
+一个极简的 Web 聊天控制台，通过本地代理连接到 [OpenClaw](https://openclaw.ai) Agent 引擎。
 
 ```
-浏览器 (index.html)
-    │  WebSocket  ws://localhost:8192
+浏览器 (public/index.html)
+    │ WebSocket  ws://localhost:8192
     ▼
-Node.js 代理服务 (server.js)          ← 注入 Authorization: Bearer <TOKEN>
-    │  WebSocket  ws://<OPENCLAW_HOST>:18789
+Node 代理 (server.js) — 负责 connect 握手 + operator 鉴权
+    │ WebSocket  ws://<openclaw-host>:18789
     ▼
-Openclaw 底层引擎
+OpenClaw Gateway
 ```
 
-前端对底层 Openclaw **完全无感知**，所有鉴权由代理层统一处理。
+实现参考 [openclaw-studio](https://github.com/grp06/openclaw-studio) 的 `OpenClawGatewayAdapter`：先以 `backend-local` profile 发起 `connect`，若 token 权限不足会自动回落到 `legacy-control-ui`（webchat）profile。
 
----
+## 前置条件
 
-## 快速启动
+- Node.js ≥ 18
+- 本机或局域网里跑着一个 OpenClaw Gateway（默认 `ws://127.0.0.1:18789`）
+- 一个可用的 OpenClaw Token
 
-### 1. 安装依赖
+## 启动
 
 ```bash
+# 1. 安装依赖
 npm install
-```
 
-### 2. 配置环境变量（推荐）
-
-复制示例文件并填入真实值：
-
-```bash
+# 2. 配置环境
 cp .env.example .env
-```
+# 编辑 .env，至少填 OPENCLAW_TOKEN
 
-编辑 `.env`：
-
-```env
-OPENCLAW_TOKEN=your_real_token_here
-OPENCLAW_WS_URL=ws://your-server-ip:18789
-PORT=8192            # 可选
-DEBUG_WS=false       # 可选，true 时打印双向 WS 报文
-```
-
-### 独立连通性测试
-
-当无法确定对端 Openclaw 是否就绪时，先跑：
-
-```bash
-npm run ping
-# 或指定地址
-node ping.js ws://192.168.31.237:18789
-```
-
-输出里应看到 `✓ WS 已打开（握手成功）`，以及 Openclaw 下发的首批消息（通常含 `connect.challenge`）。
-
-> 也可以直接修改 `server.js` 中的 `CONFIG` 对象，详见下方[配置说明](#配置说明)。
-
-### 3. 启动服务
-
-```bash
-# 生产启动
-npm start
-
-# 开发模式（文件变更自动重启，需 Node.js >= 18）
+# 3. 启动（文件改动自动重启）
 npm run dev
+# 或
+npm start
 ```
 
-服务启动后，终端输出：
+浏览器打开 <http://localhost:8192>，看到顶部状态变 **ONLINE** 即可开始聊天。回车发送，Shift+Enter 换行。
 
-```
-[Proxy] 服务启动中...
-[Proxy] 底层引擎地址: ws://127.0.0.1:18789
-[Proxy] ✓ HTTP + WebSocket 服务已启动 → http://localhost:8192
-```
+## 环境变量
 
-打开浏览器访问：**http://localhost:8192**
-
----
-
-## 配置说明
-
-所有配置集中在 `server.js` 顶部的 `CONFIG` 对象：
-
-```js
-const CONFIG = {
-  PORT: 8192,                                         // 本服务监听端口
-  OPENCLAW_WS_URL: 'ws://127.0.0.1:18789',            // Openclaw 引擎地址
-  OPENCLAW_TOKEN: process.env.OPENCLAW_TOKEN || '…',  // 鉴权 Token
-  PUBLIC_DIR: path.join(__dirname, 'public'),          // 静态文件目录
-};
-```
-
-| 配置项 | 说明 | 默认值 |
+| 变量 | 默认值 | 说明 |
 |---|---|---|
-| `PORT` | 代理服务 HTTP/WS 监听端口 | `8192` |
-| `OPENCLAW_WS_URL` | Openclaw 底层引擎的 WebSocket 地址 | `ws://127.0.0.1:18789` |
-| `OPENCLAW_TOKEN` | 注入到 Openclaw 连接头的 Bearer Token | 优先读取环境变量 `OPENCLAW_TOKEN` |
-| `PUBLIC_DIR` | 前端静态文件目录 | `./public` |
+| `OPENCLAW_TOKEN` | — | **必填**。OpenClaw 的 Bearer Token |
+| `OPENCLAW_WS_URL` | `ws://127.0.0.1:18789` | OpenClaw Gateway 的 WebSocket 地址 |
+| `PORT` | `8192` | 本服务监听端口 |
+| `HOST` | `127.0.0.1` | 监听地址。改 `0.0.0.0` 开放给局域网 |
+| `DEBUG_WS` | `false` | `true` 时打印双向 WS 帧，排查协议用 |
 
-### 通过环境变量覆盖（推荐）
+## 健康检查
 
 ```bash
-OPENCLAW_TOKEN=abc123 OPENCLAW_WS_URL=ws://192.168.1.10:18789 npm start
+curl http://localhost:8192/healthz
 ```
 
----
+返回当前 adapter 状态 (`connected` / `connecting` / `error`) 和上游地址。
 
-## 项目结构
+## 文件结构
 
 ```
 ping-openclaw/
-├── server.js           # 代理服务（Express + WebSocket）
-├── package.json        # 依赖声明
-├── .env.example        # 环境变量示例
-└── public/
-    └── index.html      # 前端测试控制台（纯 HTML，无框架依赖）
+├── server.js           # Gateway adapter + WS 桥接
+├── public/index.html   # 前端控制台
+├── probe-auth.js       # 鉴权协议嗅探工具（保留仅供诊断）
+├── ping.js             # 上游连通性探测工具
+└── .env.example
 ```
-
----
-
-## 前端控制台使用
-
-- 在底部输入框中输入任意文本或 JSON 指令
-- **Enter** 发送，**Shift + Enter** 换行
-- 返回的 JSON 数据会自动格式化展示，便于调试
-- 顶部状态指示灯：🟢 已连接 / 🔴 已断开（断线后自动重连）
-
----
-
-## 异常处理
-
-| 场景 | 行为 |
-|---|---|
-| Openclaw 引擎未启动 | 前端气泡显示错误提示，不影响代理进程 |
-| Openclaw 连接中断 | 自动关闭对应前端连接，释放资源 |
-| 前端页面关闭 | 自动断开对应的 Openclaw 连接，无资源泄漏 |
-| 未捕获的异常 | 进程级 `uncaughtException` 兜底，防止服务 Crash |
-
----
-
-## 依赖
-
-| 包 | 用途 |
-|---|---|
-| [express](https://expressjs.com/) | HTTP 服务 & 静态文件托管 |
-| [ws](https://github.com/websockets/ws) | WebSocket 服务端 & 客户端 |
