@@ -127,6 +127,41 @@ class GatewayAdapter {
     this.listeners = new Set(); // 接收 {kind:"status"|"event"|"response"|"raw", ...}
     this.profileId = 'backend-local'; // 被拒后自动切 legacy-control-ui
     this.switching = false;
+    this.defaultAgentId = null;
+    this.defaultSessionKey = null;
+    this.mainKey = 'main';
+  }
+
+  getDefaults() {
+    return {
+      agentId: this.defaultAgentId,
+      sessionKey: this.defaultSessionKey,
+      mainKey: this.mainKey,
+    };
+  }
+
+  async _hydrateDefaultAgent() {
+    const result = await this._requestOnce('agents.list', {}, 8000);
+    const mainKey = (result?.mainKey && String(result.mainKey).trim()) || 'main';
+    const agents = Array.isArray(result?.agents) ? result.agents : [];
+    if (agents.length === 0) {
+      console.warn('[Bridge] agents.list 返回空，chat.send 需要前端显式传 sessionKey');
+      this.defaultAgentId = null;
+      this.defaultSessionKey = null;
+      this.mainKey = mainKey;
+      return;
+    }
+    const first = agents[0];
+    const id = typeof first?.id === 'string' ? first.id : null;
+    if (!id) {
+      console.warn('[Bridge] agents.list 第一个 agent 没有 id 字段');
+      return;
+    }
+    this.defaultAgentId = id;
+    this.mainKey = mainKey;
+    this.defaultSessionKey = `agent:${id}:${mainKey}`;
+    const label = typeof first?.name === 'string' ? first.name : id;
+    console.log(`[Bridge] 默认 agent = ${label} (id=${id})，sessionKey = ${this.defaultSessionKey}`);
   }
 
   subscribe(fn) {
@@ -202,6 +237,10 @@ class GatewayAdapter {
             this.reconnectAttempt = 0;
             console.log('[Bridge] ✓ connect 成功，gateway 已进入 operator 模式');
             this._updateStatus('connected', null);
+            // 拉取默认 agent 与 sessionKey，供 chat.send 使用
+            this._hydrateDefaultAgent().catch((e) =>
+              console.warn(`[Bridge] agents.list 失败: ${e.message}`)
+            );
           } else {
             const code = frame.error?.code || 'CONNECT_FAILED';
             const message = frame.error?.message || 'Connect failed.';
@@ -350,6 +389,9 @@ class GatewayAdapter {
   async _switchToLegacyProfile() {
     if (this.switching) return;
     this.switching = true;
+    // 标记 stopping 避免旧 ws 的 close handler 触发 scheduleReconnect
+    this.stopping = true;
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     try {
       this.profileId = 'legacy-control-ui';
       const ws = this.ws;
@@ -363,6 +405,7 @@ class GatewayAdapter {
           try { ws.close(1000, 'switching profile'); } catch (_) { resolve(); }
         });
       }
+      this.stopping = false;
       this.reconnectAttempt = 0;
       // 直接走一次 _connect 并等到 status=connected（或 error）
       await new Promise((resolve, reject) => {
@@ -375,6 +418,7 @@ class GatewayAdapter {
       });
     } finally {
       this.switching = false;
+      this.stopping = false;
     }
   }
 }
@@ -420,7 +464,10 @@ wss.on('connection', (frontend, req) => {
         state: mapAdapterStateToFrontend(msg.status),
         message: msg.reason || '',
       });
-    } else if (msg.kind === 'event' || msg.kind === 'response') {
+    } else if (msg.kind === 'event') {
+      if (isNoisyEvent(msg.frame)) return;
+      sendJson(frontend, msg.frame);
+    } else if (msg.kind === 'response') {
       sendJson(frontend, msg.frame);
     }
   });
@@ -441,11 +488,27 @@ wss.on('connection', (frontend, req) => {
       return;
     }
 
-    // 纯文本 → 默认走 chat.send
+    // 纯文本 → 默认走 chat.send（需要 sessionKey / idempotencyKey）
+    const defaults = adapter.getDefaults();
+    if (!defaults.sessionKey) {
+      sendJson(frontend, {
+        type: 'res',
+        ok: false,
+        method: 'chat.send',
+        error: { code: 'NO_AGENT', message: 'gateway 未返回任何 agent，请先在 openclaw 里创建一个' },
+      });
+      return;
+    }
+    const runId = randomUUID();
     handleFrontendRpc(frontend, {
       method: 'chat.send',
-      params: { text },
-      clientRef: randomUUID(),
+      params: {
+        sessionKey: defaults.sessionKey,
+        message: text,
+        deliver: false,
+        idempotencyKey: runId,
+      },
+      clientRef: runId,
     });
   });
 
@@ -489,6 +552,20 @@ function handleFrontendRpc(frontend, { method, params, clientRef }) {
         error: { code: err.code || 'ERROR', message: err.message },
       });
     });
+}
+
+// gateway 推的基础设施类事件对前端没意义，过滤掉避免刷屏
+const NOISY_EVENT_NAMES = new Set(['tick', 'health']);
+function isNoisyEvent(frame) {
+  if (!frame || typeof frame.event !== 'string') return false;
+  if (NOISY_EVENT_NAMES.has(frame.event)) return true;
+  // "empty-heartbeat-file" / skipped 心跳：payload.status=="skipped" && reason 形如 "empty-heartbeat-file"
+  const p = frame.payload;
+  if (p && typeof p === 'object' && p.status === 'skipped' && typeof p.reason === 'string'
+      && p.reason.includes('heartbeat')) {
+    return true;
+  }
+  return false;
 }
 
 function mapAdapterStateToFrontend(status) {
