@@ -423,6 +423,20 @@
     .json-bool  { color: #80c8f0; }
     .json-null  { color: #909090; }
 
+    /* 对话气泡内的极简 markdown 样式 */
+    .bubble code {
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      background: rgba(0,229,160,0.08);
+      color: #b5e0a0;
+      padding: 1px 6px;
+      border-radius: 4px;
+    }
+    .bubble strong {
+      color: var(--accent);
+      font-weight: 600;
+    }
+
     /* ── 系统消息 ── */
     .sys-msg {
       display: flex;
@@ -846,67 +860,101 @@
     appendAndScroll(row);
   }
 
-  // ─── 渲染：Agent 消息（左侧）─────────────────────────────────────────────
-  // 识别 openclaw-studio 风格帧：
-  //   {type:"event", event, payload}   — gateway 单向推送
-  //   {type:"res",   ok, method, payload|error}  — 对我们请求的应答
-  // 其它未知 JSON 原样展示。
+  // ─── 渲染：Agent 消息 ─────────────────────────────────────────────────────
+  //
+  // 只处理两种帧：
+  //   {type:"event", event:"chat", payload:{runId, state, message:{content:[{type:"text",text}]}}}
+  //       —— state="delta" 是累积全文，state="final" 是最终文本；按 runId 去重合并
+  //   {type:"res",   ok:false, ...}  —— 仅用来提示请求级错误
+  //
+  // 其它帧已被服务端过滤，但为了稳健，这里静默忽略。
+  //
+  // runId -> {row, bubble} 的映射，用于流式更新同一个气泡
+  const bubbleByRunId = new Map();
+
   function renderAgentMessage(raw) {
     hideEmpty();
-    let parsed = null;
-    try { parsed = JSON.parse(raw); } catch (_) { /* 纯文本 */ }
+    let frame = null;
+    try { frame = JSON.parse(raw); } catch (_) { return; }
+    if (!frame || typeof frame !== 'object') return;
 
-    if (parsed && parsed.type === 'res') {
-      const label = parsed.ok ? `RES · ${parsed.method}` : `ERR · ${parsed.method}`;
-      const body = parsed.ok
-        ? JSON.stringify(parsed.payload ?? {}, null, 2)
-        : `${parsed.error?.code || 'ERROR'}: ${parsed.error?.message || ''}`;
-      return appendAgentBubble(label, body, parsed.ok ? 'json' : 'error');
+    if (frame.type === 'res' && frame.ok === false) {
+      const msg = `${frame.error?.code || 'ERROR'}: ${frame.error?.message || ''}`;
+      appendAgentBubble(null, msg, 'error');
+      return;
     }
 
-    if (parsed && parsed.type === 'event') {
-      // chat.* 事件的 payload.delta / payload.text 直接当对话内容渲染
-      const ev = parsed.event || 'event';
-      const maybeText = extractChatText(parsed);
-      if (maybeText !== null) {
-        return appendAgentBubble(`EVENT · ${ev}`, maybeText, 'text');
-      }
-      const body = JSON.stringify(parsed.payload ?? {}, null, 2);
-      return appendAgentBubble(`EVENT · ${ev}`, body, 'json');
-    }
+    if (frame.type !== 'event' || frame.event !== 'chat') return;
 
-    if (parsed !== null) {
-      return appendAgentBubble('AGENT', JSON.stringify(parsed, null, 2), 'json');
-    }
-    appendAgentBubble('AGENT', raw, 'text');
+    const payload = frame.payload || {};
+    const runId = typeof payload.runId === 'string' ? payload.runId : null;
+    const text = extractAssistantText(payload);
+    if (text === null) return;
+
+    updateOrCreateBubble(runId, text, payload.state);
   }
 
-  function extractChatText(frame) {
-    const p = frame.payload;
-    if (!p || typeof p !== 'object') return null;
-    if (typeof p.delta === 'string') return p.delta;
-    if (typeof p.text === 'string') return p.text;
-    if (typeof p.content === 'string') return p.content;
-    return null;
+  function extractAssistantText(payload) {
+    const msg = payload?.message;
+    if (!msg || msg.role !== 'assistant') return null;
+    const content = Array.isArray(msg.content) ? msg.content : [];
+    const parts = [];
+    for (const part of content) {
+      if (part && part.type === 'text' && typeof part.text === 'string') {
+        parts.push(part.text);
+      }
+    }
+    if (parts.length === 0) return null;
+    return parts.join('');
+  }
+
+  function updateOrCreateBubble(runId, text, state) {
+    const existing = runId ? bubbleByRunId.get(runId) : null;
+    if (existing) {
+      existing.bubble.innerHTML = renderMarkdownLite(text);
+      chatEl.scrollTop = chatEl.scrollHeight;
+      if (state === 'final' && runId) {
+        bubbleByRunId.delete(runId);
+      }
+      return;
+    }
+    const { row, bubble } = appendAgentBubble(null, text, 'markdown');
+    if (runId && state !== 'final') {
+      bubbleByRunId.set(runId, { row, bubble });
+    }
   }
 
   function appendAgentBubble(senderLabel, bodyText, kind) {
     const row = document.createElement('div');
     row.className = 'msg-row agent' + (kind === 'error' ? ' error' : '');
-    const bubble =
-      kind === 'json' ? `<div class="bubble"><pre>${highlightJson(bodyText)}</pre></div>`
-                      : `<div class="bubble">${escapeHtml(bodyText)}</div>`;
+    const bubbleHtml =
+      kind === 'markdown' ? renderMarkdownLite(bodyText)
+      : kind === 'error'  ? `⚠ ${escapeHtml(bodyText)}`
+                          : escapeHtml(bodyText);
+    const metaHtml = senderLabel
+      ? `<div class="msg-meta"><span class="msg-sender">${escapeHtml(senderLabel)}</span><span class="msg-time">${getTime()}</span></div>`
+      : `<div class="msg-meta"><span class="msg-sender">AGENT</span><span class="msg-time">${getTime()}</span></div>`;
     row.innerHTML = `
       <div class="avatar">OC</div>
       <div class="msg-body">
-        <div class="msg-meta">
-          <span class="msg-sender">${escapeHtml(senderLabel)}</span>
-          <span class="msg-time">${getTime()}</span>
-        </div>
-        ${bubble}
+        ${metaHtml}
+        <div class="bubble"></div>
       </div>
     `;
+    const bubble = row.querySelector('.bubble');
+    bubble.innerHTML = bubbleHtml;
     appendAndScroll(row);
+    return { row, bubble };
+  }
+
+  // 极简 markdown：先转义，再还原 **粗体** / `行内代码` / 换行。不支持块级代码围栏等复杂结构，
+  // 够对话用就行。
+  function renderMarkdownLite(text) {
+    const escaped = escapeHtml(text);
+    return escaped
+      .replace(/`([^`]+?)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\n/g, '<br/>');
   }
 
   // ─── 渲染：系统消息（居中分隔线） ────────────────────────────────────────

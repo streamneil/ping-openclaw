@@ -556,18 +556,11 @@ function handleFrontendRpc(frontend, { method, params, clientRef }) {
     });
 }
 
-// gateway 推的基础设施类事件对前端没意义，过滤掉避免刷屏
-const NOISY_EVENT_NAMES = new Set(['tick', 'health']);
+// 前端只关心「助手最终文本」：保留 event="chat"，其余（agent/tool/lifecycle/presence/health/tick 等）一律不转发
+const FORWARDED_EVENT_NAMES = new Set(['chat']);
 function isNoisyEvent(frame) {
-  if (!frame || typeof frame.event !== 'string') return false;
-  if (NOISY_EVENT_NAMES.has(frame.event)) return true;
-  // "empty-heartbeat-file" / skipped 心跳：payload.status=="skipped" && reason 形如 "empty-heartbeat-file"
-  const p = frame.payload;
-  if (p && typeof p === 'object' && p.status === 'skipped' && typeof p.reason === 'string'
-      && p.reason.includes('heartbeat')) {
-    return true;
-  }
-  return false;
+  if (!frame || typeof frame.event !== 'string') return true;
+  return !FORWARDED_EVENT_NAMES.has(frame.event);
 }
 
 function mapAdapterStateToFrontend(status) {
