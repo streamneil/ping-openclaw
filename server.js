@@ -48,12 +48,35 @@ const OPERATOR_SCOPES = [
   'operator.approvals',
   'operator.pairing',
 ];
-const CLIENT_DESCRIPTOR = {
-  id: 'gateway-client',
-  version: 'dev',
-  platform: 'node',
-  mode: 'backend',
+const CLIENT_PROFILES = {
+  'backend-local':     { id: 'gateway-client',       version: 'dev', platform: 'node', mode: 'backend' },
+  'legacy-control-ui': { id: 'openclaw-control-ui',  version: 'dev', platform: 'web',  mode: 'webchat' },
 };
+
+// 判断是否属于 openclaw-studio 里定义的「operator scope 缺失」错误 —— 需要切换到 legacy 身份
+function shouldFallbackToLegacy(err) {
+  if (!err) return false;
+  const code = typeof err.code === 'string' ? err.code.trim().toUpperCase() : '';
+  if (code !== 'INVALID_REQUEST') return false;
+  const msg = (err.message || '').toLowerCase();
+  return (
+    msg.includes('missing scope: operator.read') ||
+    msg.includes('missing scope: operator.write') ||
+    msg.includes('missing scope: operator.admin')
+  );
+}
+
+function deriveLegacyOrigin(wsUrl) {
+  try {
+    const u = new URL(wsUrl);
+    const scheme = u.protocol === 'wss:' ? 'https:' : 'http:';
+    // 127.0.0.1 / ::1 / 0.0.0.0 → localhost（gateway 的允许名单里通常是 localhost）
+    const host = ['127.0.0.1', '::1', '0.0.0.0'].includes(u.hostname) ? 'localhost' : u.hostname;
+    return `${scheme}//${u.port ? `${host}:${u.port}` : host}`;
+  } catch (_) {
+    return null;
+  }
+}
 
 // 方法白名单（借自 openclaw-studio 的 DEFAULT_METHOD_ALLOWLIST）
 const METHOD_ALLOWLIST = new Set([
@@ -102,6 +125,8 @@ class GatewayAdapter {
     this.nextRequestNumber = 1;
     this.pending = new Map(); // id -> {resolve, reject, timer}
     this.listeners = new Set(); // 接收 {kind:"status"|"event"|"response"|"raw", ...}
+    this.profileId = 'backend-local'; // 被拒后自动切 legacy-control-ui
+    this.switching = false;
   }
 
   subscribe(fn) {
@@ -131,8 +156,13 @@ class GatewayAdapter {
   _connect() {
     const profile = this._buildConnectParams();
     const headers = {};
-    // 对 backend-local profile：官方实现 socketOptions 是空的；我们只在有 token 时附带 Authorization 作为兜底
-    // （真实鉴权走 connect 帧的 params.auth.token，而不是 HTTP header）
+    // legacy-control-ui profile 需要伪装 Origin 绕过 CONTROL_UI_ORIGIN_NOT_ALLOWED；
+    // backend-local 不需要 Origin，也不需要 HTTP Bearer —— 鉴权走 connect 帧的 params.auth.token。
+    if (this.profileId === 'legacy-control-ui') {
+      const origin = deriveLegacyOrigin(CONFIG.OPENCLAW_WS_URL);
+      if (origin) headers.Origin = origin;
+    }
+    console.log(`[Bridge] connect profile = ${this.profileId}`);
     this._updateStatus(this.reconnectAttempt > 0 ? 'reconnecting' : 'connecting', null);
 
     const ws = new WebSocket(CONFIG.OPENCLAW_WS_URL, { headers });
@@ -230,7 +260,7 @@ class GatewayAdapter {
     return {
       minProtocol: CONNECT_PROTOCOL,
       maxProtocol: CONNECT_PROTOCOL,
-      client: { ...CLIENT_DESCRIPTOR },
+      client: { ...CLIENT_PROFILES[this.profileId] },
       role: 'operator',
       scopes: [...OPERATOR_SCOPES],
       caps: [...CONNECT_CAPABILITIES],
@@ -272,8 +302,22 @@ class GatewayAdapter {
 
   /**
    * 发送一个业务 req，返回 Promise。id 本适配器自动分配；调用方不得自带 id。
+   * 若返回「missing scope: operator.*」，自动切 legacy-control-ui profile 重试一次。
    */
-  request(method, params, timeoutMs = 15000) {
+  async request(method, params, timeoutMs = 15000) {
+    try {
+      return await this._requestOnce(method, params, timeoutMs);
+    } catch (err) {
+      if (shouldFallbackToLegacy(err) && this.profileId === 'backend-local') {
+        console.log(`[Bridge] 被 gateway 拒（${err.code}: ${err.message}）→ 切换到 legacy-control-ui 重连后重试`);
+        await this._switchToLegacyProfile();
+        return this._requestOnce(method, params, timeoutMs);
+      }
+      throw err;
+    }
+  }
+
+  _requestOnce(method, params, timeoutMs) {
     if (!METHOD_ALLOWLIST.has(method)) {
       return Promise.reject(Object.assign(new Error(`method not allowlisted: ${method}`), {
         code: 'METHOD_NOT_ALLOWED',
@@ -301,6 +345,37 @@ class GatewayAdapter {
         reject(err);
       });
     });
+  }
+
+  async _switchToLegacyProfile() {
+    if (this.switching) return;
+    this.switching = true;
+    try {
+      this.profileId = 'legacy-control-ui';
+      const ws = this.ws;
+      this.ws = null;
+      this.connectRequestId = null;
+      this._rejectAllPending('switching profile');
+      if (ws) {
+        await new Promise((resolve) => {
+          if (ws.readyState === WebSocket.CLOSED) return resolve();
+          ws.once('close', () => resolve());
+          try { ws.close(1000, 'switching profile'); } catch (_) { resolve(); }
+        });
+      }
+      this.reconnectAttempt = 0;
+      // 直接走一次 _connect 并等到 status=connected（或 error）
+      await new Promise((resolve, reject) => {
+        const off = this.subscribe((msg) => {
+          if (msg.kind !== 'status') return;
+          if (msg.status === 'connected') { off(); resolve(); }
+          else if (msg.status === 'error') { off(); reject(new Error(msg.reason || 'connect error')); }
+        });
+        this._connect();
+      });
+    } finally {
+      this.switching = false;
+    }
   }
 }
 
