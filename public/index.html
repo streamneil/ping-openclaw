@@ -847,30 +847,63 @@
   }
 
   // ─── 渲染：Agent 消息（左侧）─────────────────────────────────────────────
-  // 尝试解析 JSON 并做语法着色；失败则纯文本展示
+  // 识别 openclaw-studio 风格帧：
+  //   {type:"event", event, payload}   — gateway 单向推送
+  //   {type:"res",   ok, method, payload|error}  — 对我们请求的应答
+  // 其它未知 JSON 原样展示。
   function renderAgentMessage(raw) {
     hideEmpty();
-    const row = document.createElement('div');
-    row.className = 'msg-row agent';
+    let parsed = null;
+    try { parsed = JSON.parse(raw); } catch (_) { /* 纯文本 */ }
 
-    let content = '';
-    try {
-      const parsed = JSON.parse(raw);
-      const formatted = JSON.stringify(parsed, null, 2);
-      content = `<div class="bubble"><pre>${highlightJson(formatted)}</pre></div>`;
-    } catch {
-      content = `<div class="bubble">${escapeHtml(raw)}</div>`;
+    if (parsed && parsed.type === 'res') {
+      const label = parsed.ok ? `RES · ${parsed.method}` : `ERR · ${parsed.method}`;
+      const body = parsed.ok
+        ? JSON.stringify(parsed.payload ?? {}, null, 2)
+        : `${parsed.error?.code || 'ERROR'}: ${parsed.error?.message || ''}`;
+      return appendAgentBubble(label, body, parsed.ok ? 'json' : 'error');
     }
 
-    const senderLabel = 'AGENT';
+    if (parsed && parsed.type === 'event') {
+      // chat.* 事件的 payload.delta / payload.text 直接当对话内容渲染
+      const ev = parsed.event || 'event';
+      const maybeText = extractChatText(parsed);
+      if (maybeText !== null) {
+        return appendAgentBubble(`EVENT · ${ev}`, maybeText, 'text');
+      }
+      const body = JSON.stringify(parsed.payload ?? {}, null, 2);
+      return appendAgentBubble(`EVENT · ${ev}`, body, 'json');
+    }
+
+    if (parsed !== null) {
+      return appendAgentBubble('AGENT', JSON.stringify(parsed, null, 2), 'json');
+    }
+    appendAgentBubble('AGENT', raw, 'text');
+  }
+
+  function extractChatText(frame) {
+    const p = frame.payload;
+    if (!p || typeof p !== 'object') return null;
+    if (typeof p.delta === 'string') return p.delta;
+    if (typeof p.text === 'string') return p.text;
+    if (typeof p.content === 'string') return p.content;
+    return null;
+  }
+
+  function appendAgentBubble(senderLabel, bodyText, kind) {
+    const row = document.createElement('div');
+    row.className = 'msg-row agent' + (kind === 'error' ? ' error' : '');
+    const bubble =
+      kind === 'json' ? `<div class="bubble"><pre>${highlightJson(bodyText)}</pre></div>`
+                      : `<div class="bubble">${escapeHtml(bodyText)}</div>`;
     row.innerHTML = `
       <div class="avatar">OC</div>
       <div class="msg-body">
         <div class="msg-meta">
-          <span class="msg-sender">${senderLabel}</span>
+          <span class="msg-sender">${escapeHtml(senderLabel)}</span>
           <span class="msg-time">${getTime()}</span>
         </div>
-        ${content}
+        ${bubble}
       </div>
     `;
     appendAndScroll(row);
