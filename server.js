@@ -141,7 +141,9 @@ class GatewayAdapter {
   }
 
   async _hydrateDefaultAgent() {
-    const result = await this._requestOnce('agents.list', {}, 8000);
+    // 使用 request() 而不是 _requestOnce：如果 token 在 backend-local 下没有 operator.read
+    // （= 这个 token 绑定为 webchat 身份），会自动切到 legacy-control-ui 重试
+    const result = await this.request('agents.list', {}, 8000);
     const mainKey = (result?.mainKey && String(result.mainKey).trim()) || 'main';
     const agents = Array.isArray(result?.agents) ? result.agents : [];
     if (agents.length === 0) {
