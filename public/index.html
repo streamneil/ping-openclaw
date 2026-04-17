@@ -862,16 +862,14 @@
 
   // ─── 渲染：Agent 消息 ─────────────────────────────────────────────────────
   //
-  // 只处理两种帧：
-  //   {type:"event", event:"chat", payload:{runId, state, message:{content:[{type:"text",text}]}}}
-  //       —— state="delta" 是累积全文，state="final" 是最终文本；按 runId 去重合并
-  //   {type:"res",   ok:false, ...}  —— 仅用来提示请求级错误
+  // 策略：极简 —— 只渲染 gateway 推的 event="chat" 且 state="final" 的那条，忽略所有 delta。
+  // 服务端已过滤 tick/health/agent/tool/presence 等基础设施事件，这里再兜底一道。
   //
-  // 其它帧已被服务端过滤，但为了稳健，这里静默忽略。
+  //   {type:"event", event:"chat", payload:{state:"final", message:{content:[{type:"text",text}]}}}
+  //       → 渲染文本气泡
+  //   {type:"res",   ok:false, error}  → 渲染错误气泡（请求级失败，比如鉴权）
+  //   其它帧：忽略
   //
-  // runId -> {row, bubble} 的映射，用于流式更新同一个气泡
-  const bubbleByRunId = new Map();
-
   function renderAgentMessage(raw) {
     hideEmpty();
     let frame = null;
@@ -880,18 +878,17 @@
 
     if (frame.type === 'res' && frame.ok === false) {
       const msg = `${frame.error?.code || 'ERROR'}: ${frame.error?.message || ''}`;
-      appendAgentBubble(null, msg, 'error');
+      appendAgentBubble(msg, 'error');
       return;
     }
 
     if (frame.type !== 'event' || frame.event !== 'chat') return;
 
     const payload = frame.payload || {};
-    const runId = typeof payload.runId === 'string' ? payload.runId : null;
-    const text = extractAssistantText(payload);
-    if (text === null) return;
+    if (payload.state !== 'final') return;
 
-    updateOrCreateBubble(runId, text, payload.state);
+    const text = extractAssistantText(payload);
+    if (text) appendAgentBubble(text, 'markdown');
   }
 
   function extractAssistantText(payload) {
@@ -904,54 +901,33 @@
         parts.push(part.text);
       }
     }
-    if (parts.length === 0) return null;
-    return parts.join('');
+    return parts.length ? parts.join('') : null;
   }
 
-  function updateOrCreateBubble(runId, text, state) {
-    const existing = runId ? bubbleByRunId.get(runId) : null;
-    if (existing) {
-      existing.bubble.innerHTML = renderMarkdownLite(text);
-      chatEl.scrollTop = chatEl.scrollHeight;
-      if (state === 'final' && runId) {
-        bubbleByRunId.delete(runId);
-      }
-      return;
-    }
-    const { row, bubble } = appendAgentBubble(null, text, 'markdown');
-    if (runId && state !== 'final') {
-      bubbleByRunId.set(runId, { row, bubble });
-    }
-  }
-
-  function appendAgentBubble(senderLabel, bodyText, kind) {
+  function appendAgentBubble(bodyText, kind) {
     const row = document.createElement('div');
     row.className = 'msg-row agent' + (kind === 'error' ? ' error' : '');
     const bubbleHtml =
       kind === 'markdown' ? renderMarkdownLite(bodyText)
       : kind === 'error'  ? `⚠ ${escapeHtml(bodyText)}`
                           : escapeHtml(bodyText);
-    const metaHtml = senderLabel
-      ? `<div class="msg-meta"><span class="msg-sender">${escapeHtml(senderLabel)}</span><span class="msg-time">${getTime()}</span></div>`
-      : `<div class="msg-meta"><span class="msg-sender">AGENT</span><span class="msg-time">${getTime()}</span></div>`;
     row.innerHTML = `
       <div class="avatar">OC</div>
       <div class="msg-body">
-        ${metaHtml}
+        <div class="msg-meta">
+          <span class="msg-sender">AGENT</span>
+          <span class="msg-time">${getTime()}</span>
+        </div>
         <div class="bubble"></div>
       </div>
     `;
-    const bubble = row.querySelector('.bubble');
-    bubble.innerHTML = bubbleHtml;
+    row.querySelector('.bubble').innerHTML = bubbleHtml;
     appendAndScroll(row);
-    return { row, bubble };
   }
 
-  // 极简 markdown：先转义，再还原 **粗体** / `行内代码` / 换行。不支持块级代码围栏等复杂结构，
-  // 够对话用就行。
+  // 极简 markdown：先转义 HTML，再还原 **粗体** / `行内代码` / 换行。
   function renderMarkdownLite(text) {
-    const escaped = escapeHtml(text);
-    return escaped
+    return escapeHtml(text)
       .replace(/`([^`]+?)`/g, '<code>$1</code>')
       .replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>')
       .replace(/\n/g, '<br/>');
